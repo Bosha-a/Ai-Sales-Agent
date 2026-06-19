@@ -5,7 +5,7 @@ sentence-transformers
 groq
 streamlit
 pydantic-ai
-pymongo
+pymongo[srv]
 nest_asyncio
 bcrypt
 torch
