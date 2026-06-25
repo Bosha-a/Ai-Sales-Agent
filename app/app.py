@@ -1,8 +1,11 @@
-from datetime import timezone, datetime
+from datetime import timezone, datetime, timedelta
+
+UTC_PLUS_3 = timezone(timedelta(hours=3))
 import os
 import re
 import asyncio
 import certifi
+import html
 import streamlit as st
 from pydantic_ai.providers.groq import GroqProvider
 from qdrant_client import QdrantClient
@@ -16,18 +19,32 @@ from fastembed import SparseTextEmbedding
 from pydantic_ai import RunContext, Agent, ModelMessage
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from bson.objectid import ObjectId
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import base64
-import pandas as pd
+import json
+import time
 from auth import render_login, ROLE_PERMISSIONS
+from dashboard import render_monitoring_dashboard
+from chat import render_chat_page
+from crm import render_crm_page
+from PIL import Image as _PILImage
 
-st.set_page_config(page_title="Kayfa Agent", page_icon="🤖", layout="wide")
 
-if "authenticated" not in st.session_state or not st.session_state.authenticated:
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+_kayfa_page_icon = _PILImage.open(os.path.join(os.path.dirname(__file__), "..", "images", "kayfa_icon.png"))
+_kayfa_chat_icon = _PILImage.open(os.path.join(os.path.dirname(__file__), "..", "images", "kayfa_icon_white.png"))
+st.set_page_config(page_title="Kayfa Agent", page_icon=_kayfa_page_icon, layout="wide")
+
+if (
+    "authenticated" not in st.session_state
+    or not st.session_state.authenticated
+    or not st.session_state.get("user")
+):
     render_login()
     st.stop()
 
-user_role = st.session_state.user["role"]
+user_role = st.session_state.get("user", {}).get("role", "user")
 perms = ROLE_PERMISSIONS.get(user_role, {})
 if not perms.get("chat") and not perms.get("crm") and not perms.get("dashboard"):
     st.error("No permissions assigned.")
@@ -45,6 +62,12 @@ ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\u
 
 def dir_class(text: str) -> str:
     return "rtl" if ARABIC_RE.search(text) else "ltr"
+
+def esc(value) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+def approximate_tokens(text: str) -> int:
+    return max(1, len(str(text or "")) // 4)
 
 with open("./images/kayfa.png", "rb") as f:
     logo_b64 = base64.b64encode(f.read()).decode()
@@ -246,6 +269,10 @@ mongo_uri = st.secrets.get("MONGODB_URI")
 qdrant_api_key = st.secrets.get("QDRANT_API_KEY") 
 qdrant_url = st.secrets.get("QDRANT_URL") 
 groq_api_key = st.secrets.get("GROQ_API_KEY") 
+mongo_uri = mongo_uri or os.getenv("MONGODB_URI")
+qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
+qdrant_url = qdrant_url or os.getenv("QDRANT_URL")
+groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
 
 mongo_client = MongoClient(mongo_uri, tls=True, tlsCAFile=certifi.where())
 messages = mongo_client.kayfa.messages
@@ -255,11 +282,16 @@ messages.create_index([("username", ASCENDING)])
 def _current_user():
     return st.session_state.get("user", {}).get("username", "anonymous")
 
+def _current_user_id():
+    user = st.session_state.get("user", {})
+    return user.get("id") or user.get("username", "anonymous")
+
 def save_turn(session_id, role, content):
     messages.insert_one({
         "session_id": session_id, "role": role,
-        "content": content, "timestamp": datetime.now(timezone.utc),
+        "content": content, "timestamp": datetime.now(UTC_PLUS_3),
         "username": _current_user(),
+        "user_id": _current_user_id(),
     })
 
 def load_session(session_id):
@@ -272,9 +304,9 @@ sessions_coll.create_index([("username", ASCENDING)])
 
 def create_session(name="New Chat"):
     doc = {
-        "name": name, "username": _current_user(),
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
+        "name": name, "username": _current_user(), "user_id": _current_user_id(),
+        "created_at": datetime.now(UTC_PLUS_3),
+        "updated_at": datetime.now(UTC_PLUS_3),
     }
     result = sessions_coll.insert_one(doc)
     return str(result.inserted_id)
@@ -286,7 +318,7 @@ def get_all_sessions():
 def rename_session(session_id, name):
     sessions_coll.update_one(
         {"_id": ObjectId(session_id)},
-        {"$set": {"name": name, "updated_at": datetime.now(timezone.utc)}}
+        {"$set": {"name": name, "updated_at": datetime.now(UTC_PLUS_3)}}
     )
 
 def delete_session(session_id):
@@ -296,8 +328,81 @@ def delete_session(session_id):
 crm_coll = mongo_client.kayfa.crm_tickets
 crm_coll.create_index([("created_at", DESCENDING)])
 
+# Usage logs collection for monitoring
+usage_logs = mongo_client.kayfa.usage_logs
+usage_logs.create_index([("conversation_id", ASCENDING), ("timestamp", ASCENDING)])
+usage_logs.create_index([("message_id", ASCENDING), ("timestamp", ASCENDING)])
+usage_logs.create_index([("user_id", ASCENDING), ("timestamp", ASCENDING)])
+usage_logs.create_index([("timestamp", ASCENDING)])
+
+# Pricing configuration (per 1M tokens)
+PRICING = {
+    "groq": {
+        # Groq pricing changes over time; keep these rates in one place so cost rollups stay auditable.
+        "openai/gpt-oss-20b": {"input": 0.029, "output": 0.130},
+        "openai/gpt-oss-120b": {"input": 0.039, "output": 0.180},
+        "llama-3.1-70b-versatile": {"input": 0.59, "output": 0.79},
+        "llama-3.1-8b-instant": {"input": 0.02, "output": 0.03},
+        "default": {"input": 0.15, "output": 0.60},
+    },
+    "embedding": {
+        "sentence-transformers/all-MiniLM-L6-v2 + Qdrant/bm25": {"input": 0.0, "output": 0.0},
+        "local": {"input": 0.0, "output": 0.0},
+    }
+}
+
+def calculate_cost(model_provider: str, model_name: str, input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost for a model call."""
+    provider_pricing = PRICING.get(model_provider, {})
+    model_pricing = provider_pricing.get(model_name, provider_pricing.get("default", {"input": 0, "output": 0}))
+    input_cost = (input_tokens / 1_000_000) * model_pricing.get("input", 0)
+    output_cost = (output_tokens / 1_000_000) * model_pricing.get("output", 0)
+    return input_cost + output_cost
+
+def log_usage(
+    conversation_id: str,
+    user_id: str,
+    username: str,
+    model_provider: str,
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    tool_calls: list,
+    tool_results: list,
+    latency_ms: int,
+    step_type: str,
+    message_id: str = None,
+    trace_data: dict = None
+):
+    """Log usage to MongoDB for monitoring."""
+    cost = calculate_cost(model_provider, model_name, input_tokens, output_tokens)
+    
+    doc = {
+        "conversation_id": conversation_id,
+        "message_id": message_id or conversation_id,
+        "user_id": user_id,
+        "username": username,
+
+        "model_provider": model_provider,
+        "model_name": model_name,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+
+        "cost_usd": cost,
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+
+        "latency_ms": latency_ms,
+        "step_type": step_type,  # "llm_call", "tool_call", "embedding"
+        "trace_data": trace_data or {},
+        "timestamp": datetime.now(UTC_PLUS_3),
+    }
+    usage_logs.insert_one(doc)
+    return doc
+
 def save_lead(**kw) -> str:
-    kw["created_at"] = datetime.now(timezone.utc)
+    kw["created_at"] = datetime.now(UTC_PLUS_3)
     result = crm_coll.insert_one(kw)
     return f"✅ Lead saved — ticket ID: {result.inserted_id}"
 
@@ -328,10 +433,10 @@ Then offer to capture their contact info and create a support ticket.
 
 
 # Output Style
+- Render markdown properly — use line breaks and formatting to make responses easy to read
 - Keep responses concise (3–5 sentences for general questions, more when explaining a specific product)
 - Use bullet points only for course features, comparisons, or step-by-step instructions — not for casual conversation
 - Use light emoji (1–2 max per message) to keep the tone warm, never excessive
-- Render markdown properly — use line breaks and formatting to make responses easy to read
 - Never write walls of text — break up longer answers with spacing
 
 
@@ -368,6 +473,7 @@ You MUST collect BOTH name AND phone before calling before calling capture_lead(
 - **goal**: their motivation or what they want to achieve
 - **level**: their current skill level (beginner / intermediate / advanced)
 
+
 ## Rules - READ CAREFULLY:
 - Collect name and phone conversationally — never ask for both at once, weave them into the conversation naturally
 - Do NOT ask name/phone until you detect at least 1 buying signal
@@ -401,6 +507,7 @@ Always try to bridge back to a relevant Kayfa product when possible.
 """
 
 @st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_models():
     sparse = SparseTextEmbedding(model_name="Qdrant/bm25")
     dense = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device='cpu')
@@ -452,6 +559,24 @@ class RAGService:
         results = self.hybrid_search(query, k=limit)
         return self.format_context(results)
 
+    def search_with_trace(self, query: str, limit: int = 5):
+        results = self.hybrid_search(query, k=limit)
+        sources = []
+        previews = []
+        for r in results:
+            meta = r.get("metadata", {}) or {}
+            source = meta.get("source") or meta.get("name") or meta.get("file") or meta.get("type")
+            if source and source not in sources:
+                sources.append(source)
+            content = (r.get("content") or "").strip()
+            if content:
+                previews.append({
+                    "source": source or "unknown",
+                    "text": content[:350],
+                    "score": r.get("score"),
+                })
+        return self.format_context(results), sources, len(results), previews
+
 rag_service = RAGService(client=client, dense_embedder=dense_model, sparse_embedder=sparse_model)
 
 @dataclass
@@ -464,11 +589,37 @@ agent = Agent(model, deps_type=Dependencies, system_prompt=SYSTEM_PROMPT)
 
 @agent.tool
 def search_kayfa_knowledge_base(ctx: RunContext[Dependencies], query: str, limit: int=5) -> str:
-    return ctx.deps.rag.search(query)
+    start_time = time.time()
+    context, sources, result_count, result_preview = ctx.deps.rag.search_with_trace(query, limit=limit)
+    latency_ms = int((time.time() - start_time) * 1000)
+    sid = st.session_state.get("current_session", "")
+    message_id = st.session_state.get("current_message_id", sid)
+    current_user = st.session_state.get("user", {})
+    log_usage(
+        conversation_id=sid,
+        message_id=message_id,
+        user_id=current_user.get("id") or current_user.get("username", "unknown"),
+        username=current_user.get("name", "unknown"),
+        model_provider="embedding",
+        model_name="sentence-transformers/all-MiniLM-L6-v2 + Qdrant/bm25",
+        input_tokens=approximate_tokens(query),
+        output_tokens=0,
+        tool_calls=[{"tool": "search_kayfa_knowledge_base", "args": {"query": query, "limit": limit}}],
+        tool_results=[{"tool": "search_kayfa_knowledge_base", "result": {"chunks": result_count, "sources": sources}}],
+        latency_ms=latency_ms,
+        step_type="embedding_retrieval",
+        trace_data={
+            "query": query,
+            "sources": sources,
+            "result_shape": f"{result_count} chunks returned",
+            "result_preview": result_preview,
+        },
+    )
+    return context
 
 @agent.tool
 def capture_lead(ctx: RunContext[Dependencies], name: str = "", phone: str = "", 
-                country: str = "", language: str = "", dialect: str = "", products: str = "", 
+                country: str = "", language: str = "", products: str = "", 
                  goal: str = "", level: str = "", buying_signals: str = "", 
                  summary: str = "") -> str:
 
@@ -477,24 +628,25 @@ def capture_lead(ctx: RunContext[Dependencies], name: str = "", phone: str = "",
 
     # اتحقق من الاسم
     if not name or name in ("—", "-", "unknown", "غير معروف", "null", "none", ""):
-        return "❌ BLOCKED. Name is missing. Do NOT call this function again until the user provides their full name. Ask them now: 'بأي اسم أناديك؟'"
+        return "BLOCKED. Name is missing. Do NOT call this function again until the user provides their full name. Ask them now: 'بأي اسم أناديك؟'"
 
     # اتحقق من الرقم
     if not phone or phone in ("—", "-", "unknown", "غير معروف", "null", "none", ""):
-        return f"❌ BLOCKED. You have the name ({name}) but phone is missing. Do NOT call this function again until the user provides their phone number. Ask them now: 'ما رقم تواصلك؟'"
+        return f"BLOCKED. You have the name ({name}) but phone is missing. Do NOT call this function again until the user provides their phone number. Ask them now: 'ما رقم تواصلك؟'"
 
     # اتحقق إن الرقم فيه أرقام فعلاً
     digits = phone.replace("+", "").replace(" ", "").replace("-", "")
     if not digits.isdigit() or len(digits) < 7:
-        return f"❌ BLOCKED. Phone number ({phone}) is invalid. Ask the user for a valid phone number with country code."
+        return f"BLOCKED. Phone number ({phone}) is invalid. Ask the user for a valid phone number with country code."
 
     user = st.session_state.get("user", {})
     if not country:
         country = user.get("country", "")
 
     return save_lead(
+        user_id=_current_user_id(), username=_current_user(),
         name=name, phone=phone, country=country,
-        language=language, dialect=dialect,
+        language=language,
         products=products, goal=goal, level=level,
         buying_signals=buying_signals, summary=summary
     )
@@ -581,180 +733,24 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
+# ── Page Routing (uses modular files) ──
 if st.session_state.page == "dashboard" and has_dashboard_access:
-    st.title("Dashboard")
-    st.markdown("<p style='color:#9ca3af;font-size:14px;'>Monitoring dashboard — coming soon.</p>", unsafe_allow_html=True)
+    render_monitoring_dashboard(usage_logs)
 
 elif st.session_state.page == "crm" and has_crm_access:
-    
-    st.markdown(f"""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="css"] {{ font-family: 'Inter', sans-serif !important; }}
-    #MainMenu {{ visibility: hidden; }}
-    .stAppDeployButton {{ display: none; }}
-    footer {{ visibility: hidden; }}
-
-    h1 {{ color: white !important; font-weight: 700 !important; letter-spacing: -0.3px; }}
-
-    .lead-card {{
-        background: #1e2130;
-        border: 1px solid #e8ecf2;
-        border-radius: 16px;
-        padding: 24px 28px;
-        margin-bottom: 20px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        direction: rtl;
-        text-align: right;
-
-    }}
-    .lead-card:hover {{ box-shadow: 0 4px 16px rgba(45,59,224,0.1); }}
-    .lead-header {{
-        display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 16px; padding-bottom: 12px;
-        border-bottom: 2px solid #f0f2f6;
-    }}
-    .lead-name {{ font-size: 18px; font-weight: 700; color: white; }}
-    .lead-temp {{
-        font-size: 12px; font-weight: 600; padding: 4px 14px; border-radius: 20px;
-        text-transform: uppercase; letter-spacing: 0.5px;
-    }}
-    .temp-hot {{ background: #fee2e2; color: #dc2626; }}
-    .temp-warm {{ background: #fef3c7; color: #d97706; }}
-    .temp-cold {{ background: #dbeafe; color: #2563eb; }}
-    .lead-field {{ display: flex; gap: 8px; margin-bottom: 6px; font-size: 14px; line-height: 1.7; }}
-    .lead-label {{ font-weight: 600; color: white; min-width: 110px; }}
-    .lead-value {{ color: white; flex: 1; }}
-    .lead-summary {{ margin-top: 12px; padding: 12px 16px; background: #f8fafc; border-radius: 10px; border-right: 3px solid #4552D4; }}
-    .lead-summary p {{ margin: 0; color: #374151; line-height: 1.8; }}
-    .lead-meta {{ margin-top: 12px; font-size: 12px; color: #9ca3af; text-align: left; direction: ltr; }}
-    .badge {{
-        display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 10px;
-        border-radius: 12px; margin: 2px 4px 2px 0;
-    }}
-    .badge-products {{ background: #ede9fe; color: #7c3aed; }}
-    .badge-signals {{ background: #d1fae5; color: #059669; }}
-    .badge-objections {{ background: #fce7f3; color: #db2777; }}
-    .stats-box {{
-        background: #1e2130; border: 1px solid #e8ecf2; border-radius: 14px;
-        padding: 20px 24px; text-align: center;
-    }}
-    .stats-number {{ font-size: 32px; font-weight: 700; color: #4552D4; }}
-    .stats-label {{ font-size: 13px; color: #6b7280; margin-top: 4px; }}
-    </style>
-    <div style="position:fixed;top:14px;right:20px;z-index:999;display:flex;align-items:center;gap:8px;padding:7px 10px;">
-        <img src="data:image/png;base64,{icon_b64}" style="height:45px;display:block" alt="Kayfa">
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("<h1 style='display:flex;align-items:center;gap:10px;'>📋 CRM — إدارة العملاء المحتملين</h1>", unsafe_allow_html=True)
-    leads = list(crm_coll.find().sort("created_at", DESCENDING))
-    
-
-    if not leads:
-        st.info("لم يتم تسجيل أي عملاء محتملين بعد. تحدث مع العميل في صفحة المحادثة ليتم تسجيلهم تلقائياً.")
-    else:
-        total = len(leads)
-        hot = sum(1 for l in leads if l.get("lead_temperature", "").strip().lower() == "hot")
-        warm = sum(1 for l in leads if l.get("lead_temperature", "").strip().lower() == "warm")
-        cold = total - hot - warm
-        cols = st.columns(4)
-        with cols[0]:
-            st.markdown(f'<div class="stats-box"><div class="stats-number" style="color:white">{total}</div><div class="stats-label">Total Clients</div></div>', unsafe_allow_html=True)
-        with cols[1]:
-            st.markdown(f'<div class="stats-box"><div class="stats-number" style="color:white">{hot}</div><div class="stats-label">Very Interested 🔥</div></div>', unsafe_allow_html=True)
-        with cols[2]:
-            st.markdown(f'<div class="stats-box"><div class="stats-number" style="color:white">{warm}</div><div class="stats-label">Interested ☀️</div></div>', unsafe_allow_html=True)
-        with cols[3]:
-            st.markdown(f'<div class="stats-box"><div class="stats-number" style="color:white">{cold}</div><div class="stats-label">Asking ❄️</div></div>', unsafe_allow_html=True)
-
-        temp_filter = st.selectbox("📊Filter by level of enthusiasm", ["All", "Very Interested", "Interested", "Asking"])
-        search = st.text_input("🔍Search with Name or Phone Number", "").strip().lower()
-
-        filtered = leads
-        if temp_filter == "Very Interested":
-            filtered = [l for l in filtered if l.get("lead_temperature", "").strip().lower() == "hot"]
-        elif temp_filter == "Interested":
-            filtered = [l for l in filtered if l.get("lead_temperature", "").strip().lower() == "warm"]
-        elif temp_filter == "Asking":
-            filtered = [l for l in filtered if l.get("lead_temperature", "").strip().lower() not in ("hot", "warm")]
-        if search:
-            filtered = [l for l in filtered if search in l.get("name", "").lower() or search in l.get("phone", "").lower()]
-
-        st.markdown(f'<p style="color:#9ca3af;font-size:14px;margin:8px 0 16px;">عرض {len(filtered)} من أصل {total} تذكرة</p>', unsafe_allow_html=True)
-
-        for lead in filtered:
-            temp = lead.get("lead_temperature", "").strip().lower()
-            temp_class = "temp-hot" if temp == "hot" else "temp-warm" if temp == "warm" else "temp-cold"
-            temp_label = "Very Interested 🔥" if temp == "hot" else "Interested ☀️" if temp == "warm" else "Asking ❄️"
-            created = lead.get("created_at", datetime.now(timezone.utc))
-            date_str = created.strftime("%Y-%m-%d · %H:%M") if isinstance(created, datetime) else str(created)[:16]
-            st.markdown(f"""
-            <div class="lead-card">
-                <div class="lead-header">
-                    <div>
-                        <span class="lead-name">{lead.get('name', 'غير معروف')}</span>
-                        <span class="lead-temp {temp_class}">{temp_label}</span>
-                    </div>
-                    <div style="font-size:12px;color:#9ca3af;">{date_str}</div>
-                </div>
-                <div class="lead-field"><span class="lead-label">📞 رقم التواصل</span><span class="lead-value" style="color:white">{lead.get('phone', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">✉️ البريد</span><span class="lead-value" style="color:white">{lead.get('email', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">📍 المدينة / الدولة</span><span class="lead-value" style="color:white">{lead.get('city', '—')}، {lead.get('country', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">🗣️ اللغة / اللهجة</span><span class="lead-value" style="color:white">{lead.get('language', '—')} / {lead.get('dialect', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">📚 المنتجات محل الاهتمام</span><span class="lead-value" style="color:white"><span class="badge badge-products">{lead.get('products', '—')}</span></span></div>
-                <div class="lead-field"><span class="lead-label">🎯 الهدف</span><span class="lead-value" style="color:white">{lead.get('goal', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">📊 المستوى الحالي</span><span class="lead-value" style="color:white">{lead.get('level', '—')}</span></div>
-                <div class="lead-field"><span class="lead-label">💡 إشارات الشراء</span><span class="lead-value" style="color:white"><span class="badge badge-signals">{lead.get('buying_signals', '—')}</span></span></div>
-                <div class="lead-summary">
-                    <p><strong>📝 ملخص المحادثة:</strong> {lead.get('summary', '—')}</p>
-                    <p style="margin-top:8px"><strong>📌 الإجراء التالي:</strong> {lead.get('next_action', '—')}</p>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center;padding:30px 0 10px;font-size:13px;color:#6b7280;">All Tickets are stored in Database</div>', unsafe_allow_html=True)
+    render_crm_page(crm_coll, icon_b64)
 
 else:
-    rag_service = rag_service
-    agent = agent
-    deps = deps
-
-    st.title("Kayfa Agent")
-    sid = st.session_state.current_session
-    chat_messages = st.session_state.sessions[sid]["messages"]
-
-    for msg in chat_messages:
-        with st.chat_message(msg["role"]):
-            cls = dir_class(msg["content"])
-            st.markdown(f'<div class="{cls}">{msg["content"]}</div>', unsafe_allow_html=True)
-
-    if prompt := st.chat_input("Ask me anything about Kayfa's courses, tracks, and diplomas..."):
-        chat_messages.append({"role": "user", "content": prompt})
-        save_turn(sid, "user", prompt)
-        with st.chat_message("user"):
-            cls = dir_class(prompt)
-            st.markdown(f'<div class="{cls}">{prompt}</div>', unsafe_allow_html=True)
-        with st.chat_message("assistant"):
-            with st.spinner("Kayfa AI is thinking..."):
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop and loop.is_running():
-                    import nest_asyncio
-                    nest_asyncio.apply()
-                    model_history = st.session_state.sessions[sid].get("model_history", [])
-                    result = loop.run_until_complete(agent.run(prompt, deps=deps, message_history=model_history))
-                else:
-                    model_history = st.session_state.sessions[sid].get("model_history", [])
-                    result = asyncio.run(agent.run(prompt, deps=deps, message_history=model_history))
-            st.session_state.sessions[sid]["model_history"] = result.all_messages()[-5:]
-            cls = dir_class(result.output)
-            st.markdown(f'<div class="{cls}">{result.output}</div>', unsafe_allow_html=True)
-        chat_messages.append({"role": "assistant", "content": result.output})
-        save_turn(sid, "assistant", result.output)
-        sdata = st.session_state.sessions[sid]
-        if sdata["name"] in ("New Chat", "Session 1"):
-            new_name = prompt[:40] + ("..." if len(prompt) > 40 else "")
-            sdata["name"] = new_name
-            rename_session(sid, new_name)
+    render_chat_page(
+        agent=agent,
+        deps=deps,
+        save_turn=save_turn,
+        rename_session=rename_session,
+        dir_class=dir_class,
+        esc=esc,
+        log_usage=log_usage,
+        approximate_tokens=approximate_tokens,
+        calculate_cost=calculate_cost,
+        SYSTEM_PROMPT=SYSTEM_PROMPT,
+        assistant_avatar=_kayfa_chat_icon,
+    )

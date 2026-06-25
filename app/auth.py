@@ -10,13 +10,16 @@ import base64
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 mongo_uri = st.secrets.get("MONGODB_URI") 
+if not mongo_uri:
+    mongo_uri = os.getenv("MONGODB_URI")
 _client = MongoClient(mongo_uri, tls=True, tlsCAFile=certifi.where())
 _coll = _client.kayfa.users
 _coll.create_index([("username", ASCENDING)], unique=True)
 _kayfa_users = _client.kayfa.users
 
 ROLE_PERMISSIONS = {
-    "admin": {"chat": False, "crm": True, "dashboard": True},
+    "admin": {"chat": True, "crm": True, "dashboard": True},
+    "sales": {"chat": False, "crm": True, "dashboard": False},
     "user":  {"chat": True, "crm": False, "dashboard": False},
 }
 
@@ -68,7 +71,14 @@ def verify_user(username: str, password: str):
             name = doc.get("name") or f"{doc.get('first_name', '')} {doc.get('last_name', '')}".strip() or doc.get("username", username)
             phone = doc.get("phone", "")
             country = doc.get("country", "")
-            return {"username": doc["username"], "role": role, "name": name, "phone": phone, "country": country}
+            return {
+                "id": str(doc["_id"]),
+                "username": doc["username"],
+                "role": role,
+                "name": name,
+                "phone": phone,
+                "country": country,
+            }
     return None
 
 
@@ -185,8 +195,8 @@ def render_login():
                 full_phone = (country_code + phone_local.strip()) if phone_local.strip() else phone_local.strip()
                 if not all([first, last, phone_local, username, password]):
                     st.markdown('<p class="auth-error">❌ All fields are required</p>', unsafe_allow_html=True)
-                elif len(password) < 4:
-                    st.markdown('<p class="auth-error">❌ Password must be at least 4 characters</p>', unsafe_allow_html=True)
+                elif len(password) < 8:
+                    st.markdown('<p class="auth-error">❌ Password must be at least 8 characters</p>', unsafe_allow_html=True)
                 elif not full_phone.replace("+", "").replace(" ", "").isdigit():
                     st.markdown('<p class="auth-error">❌ Invalid phone number</p>', unsafe_allow_html=True)
                 else:
