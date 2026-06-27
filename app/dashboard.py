@@ -277,7 +277,7 @@ def render_monitoring_dashboard(usage_logs):
     last_updated = total_doc.get("last_updated")
     if last_updated:
         time_str = last_updated.strftime("%Y-%m-%d %H:%M:%S") if hasattr(last_updated, "strftime") else str(last_updated)
-        st.caption(f"Last updated: {time_str}")
+        # st.caption(f"Last updated: {time_str}")
 
     tab_charts, tab_user, tab_conversation, tab_message, tab_trace, tab_opt = st.tabs([
         "Charts", "Per User", "Per Conversation", "Per Message", "Trace Replay", "Optimization"
