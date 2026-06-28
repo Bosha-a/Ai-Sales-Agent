@@ -1,7 +1,18 @@
 import asyncio
 import time
+import re
+from dataclasses import replace
 import streamlit as st
 from bson.objectid import ObjectId
+
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+
+def _render_text(text: str):
+    """Render text with RTL direction for Arabic content."""
+    if _ARABIC_RE.search(text):
+        st.markdown(f'<div style="direction:rtl;text-align:right">{text}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(text)
 
 
 def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
@@ -16,7 +27,7 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
     for msg in chat_messages:
         avatar = assistant_avatar if msg["role"] == "assistant" else None
         with st.chat_message(msg["role"], avatar=avatar):
-            st.markdown(msg["content"])
+            _render_text(msg["content"])
 
     if prompt := st.chat_input("Ask me anything about Kayfa's courses, tracks, and diplomas..."):
         message_id = str(ObjectId())
@@ -24,7 +35,7 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
         chat_messages.append({"role": "user", "content": prompt})
         save_turn(sid, "user", prompt)
         with st.chat_message("user"):
-            st.markdown(prompt)
+            _render_text(prompt)
         with st.chat_message("assistant", avatar=assistant_avatar):
             cached = None
             if semantic_cache:
@@ -52,7 +63,7 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
                         "response": cached["response"],
                     },
                 )
-                st.markdown(cached["response"])
+                _render_text(cached["response"])
                 result_output = cached["response"]
             else:
                 with st.spinner("Kayfa AI is thinking..."):
@@ -66,10 +77,11 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
                     # unpatched event loop.  This avoids the nest_asyncio / Tornado
                     # interaction that breaks on Streamlit Cloud.
                     import concurrent.futures
+                    run_deps = replace(deps, conversation=chat_messages)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
                         _future = _pool.submit(
                             asyncio.run,
-                            active_agent.run(prompt, deps=deps, message_history=model_history),
+                            active_agent.run(prompt, deps=run_deps, message_history=model_history),
                         )
                         result = _future.result()
 
@@ -122,10 +134,10 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
                                         "tool": part.tool_name,
                                         "args": getattr(part, 'args', {})
                                     })
-                                if hasattr(part, 'tool_name') and hasattr(part, 'result'):
+                                if hasattr(part, 'tool_name') and hasattr(part, 'content'):
                                     tool_results.append({
                                         "tool": part.tool_name,
-                                        "result": str(part.result)[:500]
+                                        "result": str(part.content)[:500]
                                     })
                 except Exception:
                     pass
@@ -181,7 +193,9 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
                         safe_history.append(_m)
                 st.session_state.sessions[sid]["model_history"] = safe_history
 
-                st.markdown(result.output)
+                _render_text(result.output)
+                actual_cost = calculate_cost("groq", selected_model, input_tokens, output_tokens)
+                st.caption(f"💰 ${actual_cost:.6f} · {input_tokens:,} in / {output_tokens:,} out · {latency_ms} ms")
                 result_output = result.output
 
                 if semantic_cache:
