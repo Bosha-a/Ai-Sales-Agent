@@ -195,7 +195,7 @@ def render_chat_page(agents, deps, save_turn, rename_session, dir_class, esc,
 
                 _render_text(result.output)
                 actual_cost = calculate_cost("groq", selected_model, input_tokens, output_tokens)
-                st.caption(f"💰 ${actual_cost:.6f} · {input_tokens:,} in / {output_tokens:,} out · {latency_ms} ms")
+                # st.caption(f"💰 ${actual_cost:.6f} · {input_tokens:,} in / {output_tokens:,} out · {latency_ms} ms")
                 result_output = result.output
 
                 if semantic_cache:
